@@ -1,0 +1,512 @@
+* Источник
+  [[https://medium.com/@myte/kubernetes-nfs-and-dynamic-nfs-provisioning-97e2afb8b4a9]]
+
+* Как работать с документом?
+  Файлы экспортируются через C-c,C-v,t. Применить все манифесты разом
+  #+begin_src sh
+    $ kubectl apply -f .
+  #+end_src
+
+* Хранилище для k8s, основанное на nfs
+** Настройка nfs на хосте
+   Установка и запуск nfs-сервера:
+   #+begin_src sh
+     $ sudo emerge -av nfs-utils
+     $ sudo systemctl enable --now nfs-server.service
+   #+end_src
+
+   Подготовка каталога для экспорта (192.168.50.0/24 --- подсеть, в которой находятся ноды кластера):
+   #+begin_src sh
+     $ DIR=/srv/nfs/minikube
+     $ sudo mkdir -p ${DIR}
+     $ echo "${DIR} 192.168.50.0/24(rw,sync,no_subtree_check,no_root_squash,insecure) | sudo tee -a /etc/exports.d/minikube.exports
+   #+end_src
+
+   Применяем изменённую конфигурацию nfs-сервера:
+   #+begin_src sh
+     $ sudo exportfs -rv
+     exporting 192.168.50.0/24:/srv/nfs/minikube
+     $ sudo showmout -e
+     Export list for merlin:
+     /srv/nfs/minikube 192.168.50.252
+   #+end_src
+
+   Проверяем работу nfs-сервера (192.168.50.1 --- ip интерфейса, смотрящего $(minikube ip)):
+   #+begin_src sh
+     $ minikube ssh
+     $ sudo -s
+     $ mount -t nfs 192.168.50.1:/srv/nfs/minikube /media
+     $ mount | grep nfs
+     nfsd on /proc/fs/nfsd type nfsd (rw,relatime)
+     192.168.50.1:/srv/nfs/minikube on /media type nfs4 (rw,relatime,vers=4.2,rsize=1048576,wsize=1048576,namlen=255,hard,proto=tcp,timeo=600,retrans=2,sec=sys,clientaddr=192.168.50.252,local_lock=none,addr=192.168.50.1)
+   #+end_src
+   
+** Ручное выделение томов  
+   :PROPERTIES:
+   :ID:       c7f62516-8e7d-4a51-a60e-52798d53b091
+   :END:
+   Описываем класс хранилища постоянных томов:
+   #+begin_src yaml :tangle manual/nfs-pv.yaml :mkdirp yes
+     ---
+     apiVersion: v1
+     kind: PersistentVolume
+     metadata:
+       name: nfs-pv
+       labels:
+         name: mynfs
+     spec:
+       storageClassName: manual
+       capacity:
+         storage: 200Mi
+       accessModes:
+       - ReadWriteMany
+       nfs:
+         server: 192.168.50.1
+         path: "/srv/nfs/minikube"
+     ...
+   #+end_src
+  
+   Деплоим nfs-pv.yaml и проверяем результат:
+   #+begin_src sh
+     $ kubectl apply -f manual/nfs-pv.yaml
+     persistentvolume/nfs-pv created
+     $ kubectl get pv
+     NAME     CAPACITY   ACCESS MODES   RECLAIM POLICY   STATUS      CLAIM   STORAGECLASS   REASON   AGE
+     nfs-pv   200Mi      RWX            Retain           Available           manual                  17s
+   #+end_src
+
+   Создаём запрос на хранилище (pvc, persistent volume claim) 
+   #+begin_src yaml :tangle manual/nfs-pvc.yaml :mkdirp yes
+     ---
+     apiVersion: v1
+     kind: PersistentVolumeClaim
+     metadata:
+       name: nfs-pvc
+     spec:
+       storageClassName: manual
+       accessModes:
+       - ReadWriteMany
+       resources:
+         requests:
+           storage: 50Mi
+     ...
+   #+end_src
+
+   Деплоим его
+   #+begin_src sh
+     $ kubectl apply -f manual/nfs-pvc.yaml
+     persistentvolumeclaim/nfs-pvc created
+     $ kubectl get pvc,pv
+     NAME                            STATUS   VOLUME   CAPACITY   ACCESS MODES   STORAGECLASS   AGE
+     persistentvolumeclaim/nfs-pvc   Bound    nfs-pv   200Mi      RWX            manual         11s
+
+     NAME                      CAPACITY   ACCESS MODES   RECLAIM POLICY   STATUS   CLAIM             STORAGECLASS   REASON   AGE
+     persistentvolume/nfs-pv   200Mi      RWX            Retain           Bound    default/nfs-pvc   manual                  8m48s
+   #+end_src
+
+   Описываем под для доступа к pvc:
+   #+begin_src yaml :tangle manual/nfs-pod.yaml
+     ---
+     apiVersion: apps/v1
+     kind: Deployment
+     metadata:
+       labels:
+         app: nginx
+       name: nfs-nginx
+     spec:
+       replicas: 1
+       selector:
+         matchLabels:
+           app: nginx
+       template:
+         metadata:
+           labels:
+             app: nginx
+         spec:
+           volumes:
+           - name: nfs-test
+             persistentVolumeClaim:
+               claimName: nfs-pvc
+           containers:
+           - image: nginx
+             name: nginx
+             volumeMounts:
+             - name: nfs-test
+               mountPath: /usr/share/nginx/html
+     ...
+   #+end_src
+
+   Развёртываем nginx:
+   #+begin_src sh
+     $ kubectl apply -f manual/nfs-pod.yaml
+     deployment.apps/nfs-nginx created
+     $ kubectl get po
+     NAME                         READY   STATUS    RESTARTS   AGE
+     nfs-nginx-7df548d986-jhtjw   1/1     Running   0          14s
+   #+end_src
+
+   Тестирование:
+   #+begin_src sh
+     $ kubectl exec nfs-nginx-7df548d986-q5bkf -it -- bash
+     root@nfs-nginx-7df548d986-q5bkf:/# echo '<h1>this should hopefully work</h1>' > /usr/share/nginx/html/index.html
+     root@nfs-nginx-7df548d986-q5bkf:/# exit
+     $ ls /srv/nfs/minikube/
+     index.html
+     $ cat /srv/nfs/minikube/index.html
+     <h1>this should hopefully work</h1>
+     $ kubectl exp
+     explain  expose
+     $ kubectl expose deploy nfs-nginx --port 80 --type NodePort
+     service/nfs-nginx exposed
+     $ kubectl get svc
+     NAME         TYPE        CLUSTER-IP      EXTERNAL-IP   PORT(S)        AGE
+     kubernetes   ClusterIP   10.96.0.1       <none>        443/TCP        10h
+     nfs-nginx    NodePort    10.98.219.158   <none>        80:31849/TCP   39s
+     $ minikube service list
+     |---------------|------------------------------------|--------------|-----------------------------|
+     |   NAMESPACE   |                NAME                | TARGET PORT  |             URL             |
+     |---------------|------------------------------------|--------------|-----------------------------|
+     | default       | kubernetes                         | No node port |
+     | default       | nfs-nginx                          |           80 | http://192.168.50.252:31849 |
+     | ingress-nginx | ingress-nginx-controller           | http/80      | http://192.168.50.252:31048 |
+     |               |                                    | https/443    | http://192.168.50.252:30716 |
+     | ingress-nginx | ingress-nginx-controller-admission | No node port |
+     | kube-system   | kube-dns                           | No node port |
+     | kube-system   | registry                           | No node port |
+     |---------------|------------------------------------|--------------|-----------------------------|
+   #+end_src
+
+   Открываем браузер на странице [[http://192.168.50.252:31849]]. Видим строку, записанную в index.html.
+
+   Удаляем развёртывание, хранилище и требование к хранилищу:
+   #+begin_src sh
+     $ kubectl delete deploy nfs-nginx
+     deployment.apps "nfs-nginx" deleted
+     $ kubectl delete pvc nfs-pvc
+     persistentvolumeclaim "nfs-pvc" deleted
+     $ kubectl delete pv nfs-pv
+     persistentvolume "nfs-pv" deleted
+     $ ls /srv/nfs/minikube/
+     index.html
+     $ sudo rm /srv/nfs/minikube/index.html
+   #+end_src
+  
+** Динамическое управление хранилищем
+   :PROPERTIES:
+   :ID:       3c03dcf4-4a8d-40d6-a97a-9cdcb32bf157
+   :END:
+   Описываем роли и права, необходимые для управления хранилищем
+   #+begin_src yaml :tangle dynamic/rbac.yaml :mkdirp yes
+     ---
+     kind: ServiceAccount
+     apiVersion: v1
+     metadata:
+       name: nfs-pod-provisioner-sa
+     ...
+     ---
+     kind: ClusterRole # Role of kubernetes
+     apiVersion: rbac.authorization.k8s.io/v1 # auth API
+     metadata:
+       name: nfs-provisioner-clusterRole
+     rules:
+       - apiGroups: [""] # rules on persistentvolumes
+         resources: ["persistentvolumes"]
+         verbs: ["get", "list", "watch", "create", "delete"]
+       - apiGroups: [""]
+         resources: ["persistentvolumeclaims"]
+         verbs: ["get", "list", "watch", "update"]
+       - apiGroups: ["storage.k8s.io"]
+         resources: ["storageclasses"]
+         verbs: ["get", "list", "watch"]
+       - apiGroups: [""]
+         resources: ["events"]
+         verbs: ["create", "update", "patch"]
+     ...
+     ---
+     kind: ClusterRoleBinding
+     apiVersion: rbac.authorization.k8s.io/v1
+     metadata:
+       name: nfs-provisioner-rolebinding
+     subjects:
+       - kind: ServiceAccount
+         name: nfs-pod-provisioner-sa # defined on top of file
+         namespace: default
+     roleRef: # binding cluster role to service account
+       kind: ClusterRole
+       name: nfs-provisioner-clusterRole # name defined in clusterRole
+       apiGroup: rbac.authorization.k8s.io
+     ...
+     ---
+     kind: Role
+     apiVersion: rbac.authorization.k8s.io/v1
+     metadata:
+       name: nfs-pod-provisioner-otherRoles
+     rules:
+       - apiGroups: [""]
+         resources: ["endpoints"]
+         verbs: ["get", "list", "watch", "create", "update", "patch"]
+     ...
+     ---
+     kind: RoleBinding
+     apiVersion: rbac.authorization.k8s.io/v1
+     metadata:
+       name: nfs-pod-provisioner-otherRoles
+     subjects:
+       - kind: ServiceAccount
+         name: nfs-pod-provisioner-sa # same as top of the file
+         # replace with namespace where provisioner is deployed
+         namespace: default
+     roleRef:
+       kind: Role
+       name: nfs-pod-provisioner-otherRoles
+       apiGroup: rbac.authorization.k8s.io
+     ...
+   #+end_src
+
+   Применяем:
+   #+begin_src sh
+     $ kubectl apply -f dynamic/rbac.yaml
+     serviceaccount/nfs-pod-provisioner-sa created
+     clusterrole.rbac.authorization.k8s.io/nfs-provisioner-clusterRole created
+     clusterrolebinding.rbac.authorization.k8s.io/nfs-provisioner-rolebinding created
+     role.rbac.authorization.k8s.io/nfs-pod-provisioner-otherRoles created
+     rolebinding.rbac.authorization.k8s.io/nfs-pod-provisioner-otherRoles created
+   #+end_src
+
+   Описываем класс хранилища nfs:
+   #+begin_src yaml :tangle dynamic/nfs-class.yaml
+     ---
+     apiVersion: storage.k8s.io/v1
+     kind: StorageClass
+     metadata:
+       name: nfs-storageclass # IMPORTANT pvc needs to mention this name
+     provisioner: nfs-test # name can be anything
+     parameters:
+       archiveOnDelete: "false"
+     ...
+   #+end_src
+
+   Применяем:
+   #+begin_src sh
+     $ kubectl apply -f dynamic/nfs-class.yaml
+     storageclass.storage.k8s.io/nfs-storageclass created
+     $ kubectl get sc
+     NAME                 PROVISIONER                RECLAIMPOLICY   VOLUMEBINDINGMODE   ALLOWVOLUMEEXPANSION   AGE
+     nfs-storageclass     nfs-test                   Delete          Immediate           false                  21s
+     standard (default)   k8s.io/minikube-hostpath   Delete          Immediate           false                  24h
+   #+end_src
+
+   Описываем клиента nfs:
+   #+begin_src yaml :tangle dynamic/nfs-pod-provision.yaml
+     kind: Deployment
+     apiVersion: apps/v1
+     metadata:
+       name: nfs-pod-provisioner
+     spec:
+       replicas: 1
+       selector:
+         matchLabels:
+           app: nfs-pod-provisioner
+       strategy:
+         type: Recreate
+       template:
+         metadata:
+          labels:
+            app: nfs-pod-provisioner
+         spec:
+           serviceAccountName: nfs-pod-provisioner-sa # name of service account created in rbac.yaml
+           containers:
+           - name: nfs-pod-provisioner
+             #image: quay.io/external_storage/nfs-client-provisioner:v3.1.0-k8s1.11
+             image: gmoney23/nfs-client-provisioner:1.1
+             volumeMounts:
+             - name: nfs-provisioner-v
+               mountPath: /persistentvolumes
+             env:
+               - name: PROVISIONER_NAME # do not change
+                 value: nfs-test # SAME AS PROVISONER NAME VALUE IN STORAGECLASS
+               - name: NFS_SERVER # do not change
+                 value: 192.168.50.1 # Ip of the NFS SERVER
+               - name: NFS_PATH # do not change
+                 value: /srv/nfs/minikube # path to nfs directory setup
+           volumes:
+           - name: nfs-provisioner-v # same as volumemouts name
+             nfs:
+               server: 192.168.50.1
+               path: /srv/nfs/minikube
+   #+end_src
+
+   Применяем:
+   #+begin_src sh
+     $ kubectl apply -f dynamic/nfs-pod-provision.yaml
+     deployment.apps/nfs-pod-provisioner created
+     $ kubectl get po
+     NAME                                   READY   STATUS    RESTARTS   AGE
+     nfs-pod-provisioner-7588fcfcb6-9njgv   1/1     Running   0          43s
+     $ kubectl describe po nfs-pod-provisioner-7588fcfcb6-9njgv
+     Volumes:
+       nfs-provisioner-v:
+	 Type:      NFS (an NFS mount that lasts the lifetime of a pod)
+	 Server:    192.168.50.1
+	 Path:      /srv/nfs/minikube
+	 ReadOnly:  false
+   #+end_src
+
+   Определяем требование постоянного тома (pvc):
+   #+begin_src yaml :tangle dynamic/nfs-pvc-dynamic.yaml
+     ---
+     apiVersion: v1
+     kind: PersistentVolumeClaim
+     metadata:
+       name: nfs-pvc-test
+     spec:
+       storageClassName: nfs-storageclass # SAME NAME AS THE STORAGECLASS
+       accessModes:
+         - ReadWriteMany #  must be the same as PersistentVolume
+       resources:
+         requests:
+           storage: 50Mi
+     ...
+   #+end_src
+
+   Применяем:
+   #+begin_src sh
+     $ kubectl apply -f dynamic/nfs-pvc-dynamic.yaml
+     persistentvolumeclaim/nfs-pvc-test created
+     $ kubectl get pv,pvc
+     NAME                                                        CAPACITY   ACCESS MODES   RECLAIM POLICY   STATUS   CLAIM                  STORAGECLASS       REASON   AGE
+     persistentvolume/pvc-c357b591-4a96-4b71-bca7-dfcbd8f92cf1   50Mi       RWX            Delete           Bound    default/nfs-pvc-test   nfs-storageclass            24s
+
+     NAME                                 STATUS   VOLUME                                     CAPACITY   ACCESS MODES   STORAGECLASS       AGE
+     persistentvolumeclaim/nfs-pvc-test   Bound    pvc-c357b591-4a96-4b71-bca7-dfcbd8f92cf1   50Mi       RWX            nfs-storageclass   25s
+     $ ls /srv/nfs/minikube/
+     default-nfs-pvc-test-pvc-c357b591-4a96-4b71-bca7-dfcbd8f92cf1
+   #+end_src
+
+   Описываем развертывание nginx для тестирования:
+   #+begin_src yaml :tangle dynamic/nginx-nfs.yaml
+     ---
+     apiVersion: apps/v1
+     kind: Deployment
+     metadata:
+       labels:
+         app: nginx
+       name: nfs-nginx
+     spec:
+       replicas: 1
+       selector:
+         matchLabels:
+           app: nginx
+       template:
+         metadata:
+           labels:
+             app: nginx
+         spec:
+           volumes:
+           - name: nfs-test #
+             persistentVolumeClaim:
+               claimName: nfs-pvc-test  # same name of pvc that was created
+           containers:
+           - image: nginx
+             name: nginx
+             volumeMounts:
+             - name: nfs-test # name of volume should match claimName volume
+               mountPath: mydata2 # mount inside of contianer
+     ...
+   #+end_src
+
+   Применяем:
+   #+begin_src sh
+     $ kubectl apply -f dynamic/nginx-nfs.yaml
+     deployment.apps/nfs-nginx created
+     $ kubectl get po
+     NAME                                   READY   STATUS    RESTARTS   AGE
+     nfs-nginx-d9bbf65b5-jltkc              1/1     Running   0          14s
+     nfs-pod-provisioner-7588fcfcb6-9njgv   1/1     Running   0          26m
+     $ kubectl exec nfs-nginx-d9bbf65b5-jltkc -it -- bash
+     root@nfs-nginx-d9bbf65b5-jltkc:/# cd /mydata2/
+     root@nfs-nginx-d9bbf65b5-jltkc:/mydata2# touch testfile.txt
+     root@nfs-nginx-d9bbf65b5-jltkc:/mydata2# exit
+     exit
+     $ ls /srv/nfs/minikube/default-nfs-pvc-test-pvc-c357b591-4a96-4b71-bca7-dfcbd8f92cf1/
+     testfile.txt
+   #+end_src
+
+** Используем Helm
+   :PROPERTIES:
+   :ID:       721e05c0-428a-4184-8ede-a5e9ce85a456
+   :END:
+   #+begin_src sh
+     helm repo add nfs-subdir-external-provisioner https://kubernetes-sigs.github.io/nfs-subdir-external-provisioner
+     helm install nfs-subdir-external-provisioner nfs-subdir-external-provisioner/nfs-subdir-external-provisioner \
+	 --set nfs.server=192.168.50.1 \
+	 --set nfs.path=/srv/nfs/minikube
+   #+end_src
+   
+   Определяем pvc:
+   #+begin_src yaml :tangle helm/nfs-pvc-10gi-0.yaml :mkdirp yes
+     ---
+     apiVersion: v1
+     kind: PersistentVolumeClaim
+     metadata:
+       name: nfs-pvc-10g-0
+     spec:
+       storageClassName: nfs-client
+       accessModes:
+       - ReadWriteMany
+       resources:
+         requests:
+           storage: 10Gi
+     ...
+   #+end_src
+
+   Применяем:
+   #+begin_src sh
+     $ kubectl apply -f helm/nfs-pvc-10gi-0.yaml
+     persistentvolumeclaim/nfs-pvc-10g-0 created
+     $ kubectl get pv,pvc
+     NAME                                                        CAPACITY   ACCESS MODES   RECLAIM POLICY   STATUS   CLAIM                   STORAGECLASS   REASON   AGE
+     persistentvolume/pvc-bdd7173f-3b71-4f3e-aa5e-ffa7f4de4770   10Gi       RWX            Delete           Bound    default/nfs-pvc-10g-0   nfs-client              8s
+
+     NAME                                  STATUS   VOLUME                                     CAPACITY   ACCESS MODES   STORAGECLASS   AGE
+     persistentvolumeclaim/nfs-pvc-10g-0   Bound    pvc-bdd7173f-3b71-4f3e-aa5e-ffa7f4de4770   10Gi       RWX            nfs-client     8s
+   #+end_src
+
+   Определяем тестовый под:
+   #+begin_src yaml :tangle helm/nfs-pod.yaml
+     ---
+     apiVersion: apps/v1
+     kind: Deployment
+     metadata:
+       name: nfs-nginx
+     spec:
+       replicas: 1
+       selector:
+         matchLabels:
+           app: nginx
+       template:
+         metadata:
+           labels:
+             app: nginx
+         spec:
+           volumes:
+           - name: nfs-10g
+             persistentVolumeClaim:
+               claimName: nfs-pvc-10g-0
+           containers:
+           - image: nginx
+             name: nginx
+             volumeMounts:
+             - name: nfs-10g
+               mountPath: /nfs-10g
+     ...
+   #+end_src
+
+* Настройка ingress
+  Запускаем аддон
+  #+begin_src sh
+    minikube addons enable ingress
+  #+end_src
+
+  
+  
